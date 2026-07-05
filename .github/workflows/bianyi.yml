@@ -1,0 +1,32 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers when you create a tag like v1.0.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ESPHome
+        run: pip install esphome
+
+      - name: Build Firmware
+        run: esphome compile bms.yaml
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: .esphome/build/batterie-proxie/.pioenvs/batterie-proxie/firmware.elf
+          # Note: Adjust the path above if your esphome 'name' differs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
