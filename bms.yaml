@@ -1,0 +1,911 @@
+substitutions:
+  name: "batterie-proxie"
+  friendly_name: "Batterie Monitor"
+  project_name: "community.jk-bms-monitor-s3"
+  project_version: "1.1.0"
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  compile_process_limit: 1
+  
+  platformio_options:
+    build_flags: 
+      - -Os          # Optimize for size (braucht weniger RAM beim Kompilieren)
+      - -mlongcalls  # Hilft bei großen Programmen auf dem ESP32
+
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          std::string mac = id(conf_bms_mac).state;
+          std::string clean_mac = "";
+          for (char c : mac) {
+            if (c != ' ' && c != '\n' && c != '\r') clean_mac += c;
+          }
+          if (clean_mac.length() >= 17) {
+            uint64_t address = 0;
+            int values[6];
+            if (sscanf(clean_mac.c_str(), "%x:%x:%x:%x:%x:%x", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6) {
+              for (int i = 0; i < 6; i++) {
+                address |= (uint64_t)values[i] << (40 - i * 8);
+              }
+              id(bms_ble_client)->set_address(address);
+            }
+          }
+      - light.turn_on:
+          id: backlight_light
+          brightness: !lambda "return id(conf_bright_high).state / 100.0f;"
+      - lambda: |-
+           if (id(conf_bms_mac).state.length() < 17) {
+             id(lcd_display).show_page(id(page_setup));
+           } else {
+             id(lcd_display).show_page(id(page_boot));
+           }
+
+external_components:
+  - source: github://syssi/esphome-jk-bms@main
+
+esp32:
+  board: m5stack-atoms3
+  framework:
+    type: arduino
+
+# --- WIFI & WEB ---
+qr_code:
+  - id: wifi_qr
+    value: "WIFI:S:Batterie-Setup;T:nopass;;"
+
+wifi:
+  # use_address: "192.168.178.XX" # Falls OTA zickt, hier IP eintragen
+  ap:
+    ssid: "Batterie-Setup"
+    password: "" 
+    ap_timeout: 2min
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 2
+
+logger:
+  level: WARN
+  baud_rate: 0 
+
+api:
+  id: api_server 
+
+ota:
+  - platform: esphome
+
+esp32_ble:
+  max_connections: 4
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+bluetooth_proxy:
+  active: true
+
+ble_client:
+  mac_address: "00:00:00:00:00:00"
+  id: bms_ble_client
+
+# --- KONFIGURATION ---
+text:
+  - platform: template
+    name: "Konfig: BMS MAC Adresse"
+    id: conf_bms_mac
+    optimistic: true
+    restore_value: true 
+    mode: text
+    entity_category: config 
+    icon: "mdi:bluetooth-settings"
+
+  - platform: template
+    name: "Konfig: HA Switch 1 Entity ID"
+    id: conf_ha_entity
+    optimistic: true
+    restore_value: true
+    mode: text
+    entity_category: config
+    icon: "mdi:home-assistant"
+    initial_value: "switch.demo_1"
+  
+  - platform: template
+    name: "Konfig: HA Switch 2 Entity ID"
+    id: conf_ha_entity_2
+    optimistic: true
+    restore_value: true
+    mode: text
+    entity_category: config
+    icon: "mdi:home-assistant"
+    initial_value: "switch.demo_2"
+
+number:
+  - platform: template
+    name: "Display: Auto-Wechsel (Sekunden)"
+    id: conf_page_cycle_time
+    icon: "mdi:timer-sync"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      then:
+        - globals.set: { id: cycle_timer_counter, value: '0' }
+
+  # --- NEU: TIMEOUTS & PULS ---
+  - platform: template
+    name: "Display: Auto-Aus Timeout (Sekunden)"
+    id: conf_display_timeout
+    icon: "mdi:monitor-off"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 600
+    step: 10
+    initial_value: 60 
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      then:
+        - globals.set: { id: display_timeout_counter, value: '0' }
+        - light.turn_on: backlight_light
+
+  - platform: template
+    name: "Display: Auto-An Intervall (Sekunden)"
+    id: conf_wake_interval
+    icon: "mdi:monitor-eye"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 3600
+    step: 10
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      then:
+        - globals.set: { id: wake_timer_counter, value: '0' }
+
+  # --- ANZEIGE KONFIG ---
+  - platform: template
+    name: "Anzeige: Max. Leistung (für Balken)"
+    id: conf_max_pwr
+    icon: "mdi:gauge"
+    unit_of_measurement: "W"
+    min_value: 100
+    max_value: 20000
+    step: 100
+    initial_value: 2000
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  - platform: template
+    name: "Anzeige: Max. Zelldrift (für Balken)"
+    id: conf_max_drift
+    icon: "mdi:chart-bell-curve"
+    unit_of_measurement: "V"
+    min_value: 0.005
+    max_value: 0.500
+    step: 0.005
+    initial_value: 0.050
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  # --- SOC KALKULATION KONFIG ---
+  - platform: template
+    name: "SOC-Berechnung: Min. Spannung (0%)"
+    id: conf_v_min
+    icon: "mdi:battery-minus"
+    unit_of_measurement: "V"
+    min_value: 0
+    max_value: 200
+    step: 0.1
+    initial_value: 24.0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  - platform: template
+    name: "SOC-Berechnung: Max. Spannung (100%)"
+    id: conf_v_max
+    icon: "mdi:battery-plus"
+    unit_of_measurement: "V"
+    min_value: 0
+    max_value: 200
+    step: 0.1
+    initial_value: 28.0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  - platform: template
+    name: "Helligkeit: Stufe Hell"
+    id: conf_bright_high
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 1
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    icon: "mdi:brightness-7"
+
+  - platform: template
+    name: "Helligkeit: Stufe Gedimmt"
+    id: conf_bright_low
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 70
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    icon: "mdi:brightness-4"
+
+select:
+  - platform: template
+    name: "Konfig: SOC Quelle"
+    id: conf_soc_source
+    optimistic: true
+    options: ["BMS SOC", "Spannung Kalkuliert"]
+    initial_option: "BMS SOC"
+    restore_value: true
+    entity_category: config
+    icon: "mdi:battery-settings"
+
+  - platform: template
+    name: "Konfig: Sprache"
+    id: conf_lang
+    optimistic: true
+    options: ["Deutsch", "English"]
+    initial_option: "Deutsch"
+    restore_value: true 
+    entity_category: config
+    icon: "mdi:translate"
+
+  - platform: template
+    name: "Button: Einzelklick"
+    id: btn_action_single
+    optimistic: true
+    restore_value: true
+    options: ["Nichts", "Nächste Seite", "Helligkeit ändern", "HA Switch 1 umschalten", "HA Switch 2 umschalten"]
+    initial_option: "Nächste Seite"
+    entity_category: config
+    icon: "mdi:gesture-tap"
+
+  - platform: template
+    name: "Button: Doppelklick"
+    id: btn_action_double
+    optimistic: true
+    restore_value: true
+    options: ["Nichts", "Nächste Seite", "Helligkeit ändern", "HA Switch 1 umschalten", "HA Switch 2 umschalten"]
+    initial_option: "Helligkeit ändern" 
+    entity_category: config
+    icon: "mdi:gesture-double-tap"
+
+  - platform: template
+    name: "Button: Lang Drücken"
+    id: btn_action_long
+    optimistic: true
+    restore_value: true
+    options: ["Nichts", "Nächste Seite", "Helligkeit ändern", "HA Switch 1 umschalten", "HA Switch 2 umschalten"]
+    initial_option: "Helligkeit ändern"
+    entity_category: config
+    icon: "mdi:gesture-tap-hold"
+
+switch:
+  - platform: restart
+    name: "Gerät neu starten"
+    entity_category: config
+    icon: "mdi:restart"
+
+  - platform: jk_bms_ble
+    jk_bms_ble_id: bms0
+    charging: { name: "BMS Laden", id: bms_laden_switch }
+    discharging: { name: "BMS Entladen", id: bms_entladen_switch }
+    balancer: { name: "BMS Balancer", id: bms_balancer_switch }
+    disable_pcl_module: { name: "BMS PCL", id: bms_pcl_switch }
+
+globals:
+  - id: show_border
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: boot_timer_sec
+    type: int
+    initial_value: '0' 
+  - id: cycle_timer_counter
+    type: int
+    initial_value: '0'
+  - id: display_timeout_counter
+    type: int
+    initial_value: '0'
+  - id: wake_timer_counter
+    type: int
+    initial_value: '0'
+
+# --- LOGIK SCRIPT ---
+script:
+  - id: flash_border
+    mode: restart
+    then:
+      - globals.set: { id: show_border, value: 'true' }
+      - component.update: lcd_display
+      - delay: 200ms
+      - globals.set: { id: show_border, value: 'false' }
+      - component.update: lcd_display
+      
+  - id: execute_button_action
+    parameters:
+      selection: string
+    then:
+      # --- WAKE UP LOGIK ---
+      - if:
+          condition:
+            light.is_off: backlight_light
+          then:
+            - light.turn_on: backlight_light
+            - globals.set: { id: display_timeout_counter, value: '0' }
+            - globals.set: { id: wake_timer_counter, value: '0' } 
+            - script.stop: execute_button_action 
+      
+      # --- NORMALE AKTION ---
+      - script.execute: flash_border
+      - globals.set: { id: cycle_timer_counter, value: '0' }
+      - globals.set: { id: display_timeout_counter, value: '0' }
+      - globals.set: { id: wake_timer_counter, value: '0' }
+      
+      - lambda: |-
+          if (selection == "Nächste Seite") {
+            auto *active = id(lcd_display).get_active_page();
+            if (active == id(page_boot) || active == id(page3) || active == id(page_setup)) {
+               id(lcd_display).show_page(id(page1));
+            } else {
+               id(lcd_display).show_next_page();
+            }
+          }
+          else if (selection == "Helligkeit ändern") {
+             float val_high = id(conf_bright_high).state / 100.0f;
+             float val_low = id(conf_bright_low).state / 100.0f;
+             float current = id(backlight_light).remote_values.get_brightness();
+             auto call = id(backlight_light).turn_on();
+             
+             if (current >= (val_high - 0.05f)) {
+                call.set_brightness(val_low);
+             } else {
+                call.set_brightness(val_high);
+             }
+             call.perform();
+          }
+
+      # Logik für Home Assistant Switch 1
+      - if:
+          condition:
+            lambda: 'return selection == "HA Switch 1 umschalten";'
+          then:
+            - homeassistant.service:
+                service: switch.toggle
+                data:
+                  entity_id: !lambda 'return id(conf_ha_entity).state;'
+
+      # Logik für Home Assistant Switch 2
+      - if:
+          condition:
+            lambda: 'return selection == "HA Switch 2 umschalten";'
+          then:
+            - homeassistant.service:
+                service: switch.toggle
+                data:
+                  entity_id: !lambda 'return id(conf_ha_entity_2).state;'
+
+jk_bms_ble:
+  - ble_client_id: bms_ble_client
+    id: bms0
+    protocol_version: JK02_32S
+
+# --- SENSOREN ---
+sensor:
+  - platform: jk_bms_ble
+    jk_bms_ble_id: bms0
+    # ACHTUNG: Hier keine neuen IDs vergeben für bestehende Werte!
+    total_voltage: { name: "BMS Gesamtspannung", id: bms_v }
+    current: { name: "BMS Strom", id: bms_current, accuracy_decimals: 2 }
+    power: { name: "BMS Leistung", id: bms_watt, unit_of_measurement: "W" }
+    capacity_remaining: { name: "BMS Restkapazität Ah", id: bms_ah }
+    total_battery_capacity_setting: { name: "BMS Nennkapazität Ah", id: bms_nom_cap }
+    charging_cycles: { name: "BMS Ladezyklen" }
+    total_charging_cycle_capacity: { name: "BMS Gesamte Ladekapazität" }
+    total_runtime: { name: "BMS Laufzeit" } # ID bms_runtime wurde im orig nicht benutzt, lassen wir weg wenn nicht nötig, sonst gibt es konflikt mit template
+    delta_cell_voltage: { name: "BMS Differenz Zellspannung", id: bms_delta }
+    average_cell_voltage: { name: "BMS Durchschnittliche Zellspannung" }
+    min_cell_voltage: { name: "BMS Min Zellspannung", id: bms_min_v }
+    max_cell_voltage: { name: "BMS Max Zellspannung", id: bms_max_v }
+    min_voltage_cell: { name: "BMS Min Spannung Zellnummer", id: bms_min_cell_num }
+    max_voltage_cell: { name: "BMS Max Spannung Zellnummer", id: bms_max_cell_num }
+    power_tube_temperature: { name: "BMS Mosfet Temperatur", id: bms_temp }
+    temperature_sensor_1: { name: "BMS Temperatur Sensor 1" }
+    temperature_sensor_2: { name: "BMS Temperatur Sensor 2" }
+    balancing_current: { name: "BMS Balancing Strom" }
+    
+    # Einzelzellen 1-32 (EXAKT WIE IM ORIGINAL)
+    cell_voltage_1: { name: "Zelle 01", id: batterie_proxie_zelle_01 }
+    cell_voltage_2: { name: "Zelle 02", id: batterie_proxie_zelle_02 }
+    cell_voltage_3: { name: "Zelle 03", id: batterie_proxie_zelle_03 }
+    cell_voltage_4: { name: "Zelle 04", id: batterie_proxie_zelle_04 }
+    cell_voltage_5: { name: "Zelle 05", id: batterie_proxie_zelle_05 }
+    cell_voltage_6: { name: "Zelle 06", id: batterie_proxie_zelle_06 }
+    cell_voltage_7: { name: "Zelle 07", id: batterie_proxie_zelle_07 }
+    cell_voltage_8: { name: "Zelle 08", id: batterie_proxie_zelle_08 }
+    cell_voltage_9: { name: "Zelle 09", id: batterie_proxie_zelle_09 }
+    cell_voltage_10: { name: "Zelle 10", id: batterie_proxie_zelle_10 }
+    cell_voltage_11: { name: "Zelle 11", id: batterie_proxie_zelle_11 }
+    cell_voltage_12: { name: "Zelle 12", id: batterie_proxie_zelle_12 }
+    cell_voltage_13: { name: "Zelle 13", id: batterie_proxie_zelle_13 }
+    cell_voltage_14: { name: "Zelle 14", id: batterie_proxie_zelle_14 }
+    cell_voltage_15: { name: "Zelle 15", id: batterie_proxie_zelle_15 }
+    cell_voltage_16: { name: "Zelle 16", id: batterie_proxie_zelle_16 }
+    cell_voltage_17: { name: "Zelle 17", id: batterie_proxie_zelle_17 }
+    cell_voltage_18: { name: "Zelle 18", id: batterie_proxie_zelle_18 }
+    cell_voltage_19: { name: "Zelle 19", id: batterie_proxie_zelle_19 }
+    cell_voltage_20: { name: "Zelle 20", id: batterie_proxie_zelle_20 }
+    cell_voltage_21: { name: "Zelle 21", id: batterie_proxie_zelle_21 }
+    cell_voltage_22: { name: "Zelle 22", id: batterie_proxie_zelle_22 }
+    cell_voltage_23: { name: "Zelle 23", id: batterie_proxie_zelle_23 }
+    cell_voltage_24: { name: "Zelle 24", id: batterie_proxie_zelle_24 }
+    cell_voltage_25: { name: "Zelle 25", id: batterie_proxie_zelle_25 }
+    cell_voltage_26: { name: "Zelle 26", id: batterie_proxie_zelle_26 }
+    cell_voltage_27: { name: "Zelle 27", id: batterie_proxie_zelle_27 }
+    cell_voltage_28: { name: "Zelle 28", id: batterie_proxie_zelle_28 }
+    cell_voltage_29: { name: "Zelle 29", id: batterie_proxie_zelle_29 }
+    cell_voltage_30: { name: "Zelle 30", id: batterie_proxie_zelle_30 }
+    cell_voltage_31: { name: "Zelle 31", id: batterie_proxie_zelle_31 }
+    cell_voltage_32: { name: "Zelle 32", id: batterie_proxie_zelle_32 }
+
+    # Widerstände 1-32 (EXAKT WIE IM ORIGINAL)
+    cell_resistance_1: { name: "Widerstand Zelle 01" }
+    cell_resistance_2: { name: "Widerstand Zelle 02" }
+    cell_resistance_3: { name: "Widerstand Zelle 03" }
+    cell_resistance_4: { name: "Widerstand Zelle 04" }
+    cell_resistance_5: { name: "Widerstand Zelle 05" }
+    cell_resistance_6: { name: "Widerstand Zelle 06" }
+    cell_resistance_7: { name: "Widerstand Zelle 07" }
+    cell_resistance_8: { name: "Widerstand Zelle 08" }
+    cell_resistance_9: { name: "Widerstand Zelle 09" }
+    cell_resistance_10: { name: "Widerstand Zelle 10" }
+    cell_resistance_11: { name: "Widerstand Zelle 11" }
+    cell_resistance_12: { name: "Widerstand Zelle 12" }
+    cell_resistance_13: { name: "Widerstand Zelle 13" }
+    cell_resistance_14: { name: "Widerstand Zelle 14" }
+    cell_resistance_15: { name: "Widerstand Zelle 15" }
+    cell_resistance_16: { name: "Widerstand Zelle 16" }
+    cell_resistance_17: { name: "Widerstand Zelle 17" }
+    cell_resistance_18: { name: "Widerstand Zelle 18" }
+    cell_resistance_19: { name: "Widerstand Zelle 19" }
+    cell_resistance_20: { name: "Widerstand Zelle 20" }
+    cell_resistance_21: { name: "Widerstand Zelle 21" }
+    cell_resistance_22: { name: "Widerstand Zelle 22" }
+    cell_resistance_23: { name: "Widerstand Zelle 23" }
+    cell_resistance_24: { name: "Widerstand Zelle 24" }
+    cell_resistance_25: { name: "Widerstand Zelle 25" }
+    cell_resistance_26: { name: "Widerstand Zelle 26" }
+    cell_resistance_27: { name: "Widerstand Zelle 27" }
+    cell_resistance_28: { name: "Widerstand Zelle 28" }
+    cell_resistance_29: { name: "Widerstand Zelle 29" }
+    cell_resistance_30: { name: "Widerstand Zelle 30" }
+    cell_resistance_31: { name: "Widerstand Zelle 31" }
+    cell_resistance_32: { name: "Widerstand Zelle 32" }
+
+  # --- 1. ORIGINAL SOC SENSOR (WICHTIG: ID BEIBEHALTEN) ---
+  - platform: template
+    name: "BMS SOC Prozent"
+    id: bms_soc_final
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    lambda: |-
+      if (id(bms_ah).has_state() && id(bms_nom_cap).has_state() && id(bms_nom_cap).state > 0) {
+        return (id(bms_ah).state / id(bms_nom_cap).state) * 100.0;
+      }
+      return {};
+    update_interval: 10s
+
+  # --- 2. ZUSÄTZLICHER SPANNUNGS-SOC (NEUE ID) ---
+  - platform: template
+    name: "BMS SOC (Spannung)"
+    id: bms_soc_voltage
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    lambda: |-
+      if (id(bms_v).has_state()) {
+          float v = id(bms_v).state;
+          float min_v = id(conf_v_min).state;
+          float max_v = id(conf_v_max).state;
+          
+          if (max_v <= min_v) return 0.0;
+          
+          float calc = (v - min_v) / (max_v - min_v) * 100.0f;
+          if (calc < 0) calc = 0;
+          if (calc > 100) calc = 100;
+          return calc;
+      }
+      return {};
+    update_interval: 5s
+    
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+# --- BINARY SENSOR ---
+binary_sensor:
+  - platform: jk_bms_ble
+    jk_bms_ble_id: bms0
+    charging: { name: "BMS Laden Status" }
+    discharging: { name: "BMS Entladen Status" }
+    balancing: { name: "BMS Balancing aktiv", id: bms_bal_aktiv }
+    # Online Status war im original nicht drin, wenn du ihn willst, einkommentieren:
+    # online_status: { name: "BMS Online" }
+
+  - platform: gpio
+    pin: {number: 41, inverted: true, mode: {input: true, pullup: true}}
+    name: "Atom S3 Knopf"
+    internal: true 
+    on_multi_click:
+      # 1. Doppelklick
+      - timing:
+          - ON for 2ms to 400ms
+          - OFF for 2ms to 400ms
+          - ON for 2ms to 400ms
+        then:
+          - script.execute:
+              id: execute_button_action
+              selection: !lambda 'return id(btn_action_double).current_option();'
+              
+      # 2. Einzelklick
+      - timing:
+          - ON for 2ms to 400ms
+          - OFF for at least 401ms
+        then:
+          - script.execute:
+              id: execute_button_action
+              selection: !lambda 'return id(btn_action_single).current_option();'
+              
+      # 3. Lang drücken
+      - timing:
+          - ON for at least 800ms
+        then:
+          - script.execute:
+              id: execute_button_action
+              selection: !lambda 'return id(btn_action_long).current_option();'
+
+text_sensor:
+  - platform: jk_bms_ble
+    jk_bms_ble_id: bms0
+    errors: { name: "BMS Fehler" }
+    hardware_version: { id: bms_hw_raw, internal: true }
+    software_version: { id: bms_sw_raw, internal: true }
+
+  - platform: template
+    name: "BMS Hardware Version"
+    icon: "mdi:chip"
+    entity_category: diagnostic
+    lambda: |-
+      if (id(bms_hw_raw).has_state()) {
+        std::string raw = id(bms_hw_raw).state;
+        std::string clean = "";
+        for (char c : raw) { if (c >= 32 && c <= 126) clean += c; }
+        return clean;
+      }
+      return {};
+    update_interval: 60s
+
+  - platform: template
+    name: "BMS Software Version"
+    icon: "mdi:file-code"
+    entity_category: diagnostic
+    lambda: |-
+      if (id(bms_sw_raw).has_state()) {
+        std::string raw = id(bms_sw_raw).state;
+        std::string clean = "";
+        for (char c : raw) { if (c >= 32 && c <= 126) clean += c; }
+        return clean;
+      }
+      return {};
+    update_interval: 60s
+    
+spi:
+  clk_pin: 17
+  mosi_pin: 21
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_huge
+    size: 42 
+    glyphs: '0123456789%-.Wnak ' # k ist drin!
+  - file: "gfonts://Roboto"
+    id: font_large
+    size: 28
+    glyphs: '0123456789.VA- JKTOLE'
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 14
+    glyphs: '0123456789.:% -ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°<>'
+
+display:
+  - platform: st7789v
+    id: lcd_display
+    model: Custom
+    height: 128
+    width: 128
+    offset_height: 2
+    offset_width: 1
+    cs_pin: 15
+    dc_pin: 33
+    reset_pin: 34
+    rotation: 0
+    update_interval: 50ms
+    pages:
+      # --- PAGE SETUP ---
+      - id: page_setup
+        lambda: |-
+          it.fill(Color(0,0,0));
+          if (id(show_border)) it.rectangle(0,0,128,128,Color(0,0,255));
+          it.print(64, 5, id(font_small), Color(255, 50, 50), TextAlign::TOP_CENTER, "SETUP MODE");
+          it.qr_code(20, 25, id(wifi_qr), Color(255, 255, 255), 3);
+          it.print(64, 115, id(font_small), Color(200, 200, 200), TextAlign::CENTER, "Scan to Connect");
+
+      # --- PAGE BOOT ---
+      - id: page_boot
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          if (id(show_border)) {
+            it.rectangle(0, 0, 128, 128, Color(0, 0, 255));
+            it.rectangle(1, 1, 126, 126, Color(0, 0, 255));
+          }
+          if (id(api_server).is_connected()) it.filled_circle(115, 6, 2, Color(100, 255, 100));
+          if (id(bms_ble_client).connected()) it.filled_circle(124, 6, 2, Color(0, 100, 255));
+
+          int h = 16;             
+          int w_rect = 100;       
+          int r = h / 2;          
+          int x = 64 - (w_rect / 2); 
+          int y = 56;             
+
+          it.filled_circle(x, y + r, r, Color(50, 50, 50));
+          it.filled_circle(x + w_rect, y + r, r, Color(50, 50, 50));
+          it.filled_rectangle(x, y, w_rect, h + 1, Color(50, 50, 50));
+
+          float progress = clamp((float)millis() / 15000.0f, 0.0f, 1.0f);
+          int current_w = (int)(progress * (float)w_rect);
+
+          if (current_w >= 0) {
+            it.filled_circle(x, y + r, r, Color(0, 120, 255));
+            it.filled_rectangle(x, y, current_w, h + 1, Color(0, 120, 255));
+            it.filled_circle(x + current_w, y + r, r, Color(0, 120, 255));
+          }
+          it.print(64, 115, id(font_small), Color(200, 200, 200), TextAlign::CENTER, "SYSTEM START...");
+
+      # --- PAGE 1 (BATTERIE) ---
+      - id: page1
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          if (id(show_border)) { it.rectangle(0, 0, 128, 128, Color(0, 0, 255)); it.rectangle(1, 1, 126, 126, Color(0, 0, 255)); }
+          if (id(api_server).is_connected()) it.filled_circle(115, 6, 2, Color(100, 255, 100));
+          if (id(bms_ble_client).connected()) it.filled_circle(124, 6, 2, Color(0, 100, 255));
+
+          if (id(conf_lang).current_option() == "Deutsch") {
+            it.print(2, 2, id(font_small), Color(80, 80, 80), TextAlign::TOP_LEFT, "BATTERIE");
+          } else {
+            it.print(2, 2, id(font_small), Color(80, 80, 80), TextAlign::TOP_LEFT, "BATTERY");
+          }
+          
+          // DISPLAY LOGIK: WELCHEN SOC ANZEIGEN?
+          float soc = 0.0;
+          if (id(conf_soc_source).current_option() == "Spannung Kalkuliert") {
+             if (id(bms_soc_voltage).has_state()) soc = id(bms_soc_voltage).state;
+          } else {
+             if (id(bms_soc_final).has_state()) soc = id(bms_soc_final).state;
+          }
+          
+          if (std::isnan(soc)) soc = 0.0;
+
+          Color stat_color = (soc < 20) ? Color(255,0,0) : (soc < 50) ? Color(255,165,0) : Color(0,255,0);
+          it.printf(64, 35, id(font_huge), stat_color, TextAlign::CENTER, "%.0f%%", soc);
+          if (id(bms_v).has_state()) it.printf(64, 80, id(font_large), Color(200, 200, 200), TextAlign::CENTER, "%.1f V", id(bms_v).state);
+          
+          it.filled_circle(14, 115, 7, Color(40, 40, 40)); 
+          it.filled_circle(114, 115, 7, Color(40, 40, 40)); 
+          it.filled_rectangle(14, 108, 100, 15, Color(40, 40, 40)); 
+          int bar_w = (int)soc;
+          if (bar_w > 0) {
+            it.filled_circle(14, 115, 7, stat_color);
+            it.filled_rectangle(14, 108, bar_w, 15, stat_color);
+            it.filled_circle(14 + bar_w, 115, 7, stat_color);
+          }
+
+      # --- PAGE 2 (LEISTUNG) ---
+      - id: page2 
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          if (id(show_border)) it.rectangle(0,0,128,128,Color(0,0,255));
+          if (id(api_server).is_connected()) it.filled_circle(115, 6, 2, Color(100, 255, 100));
+          if (id(bms_ble_client).connected()) it.filled_circle(124, 6, 2, Color(0, 100, 255));
+
+          if (id(conf_lang).current_option() == "Deutsch") {
+            it.print(2, 2, id(font_small), Color(80, 80, 80), TextAlign::TOP_LEFT, "LEISTUNG");
+          } else {
+            it.print(2, 2, id(font_small), Color(80, 80, 80), TextAlign::TOP_LEFT, "POWER");
+          }
+          
+          float pwr = id(bms_watt).state;
+          float cur = id(bms_current).state;
+          if (std::isnan(pwr)) pwr = 0.0;
+          if (std::isnan(cur)) cur = 0.0;
+
+          Color p_color = (pwr > 5) ? Color(0,255,0) : (pwr < -5) ? Color(255,50,50) : Color(150,150,150);
+          Color bg_color = Color(40, 40, 40); 
+          
+          // KW LOGIK
+          if (fabs(pwr) > 999) {
+             it.printf(64, 35, id(font_huge), p_color, TextAlign::CENTER, "%.1f kW", fabs(pwr) / 1000.0);
+          } else {
+             it.printf(64, 35, id(font_huge), p_color, TextAlign::CENTER, "%.0f W", fabs(pwr));
+          }
+
+          if (id(bms_current).has_state()) {
+            it.printf(64, 80, id(font_large), Color(200, 200, 200), TextAlign::CENTER, "%.1f A", fabs(cur));
+          }
+          
+          it.filled_circle(14, 115, 7, bg_color); 
+          it.filled_circle(114, 115, 7, bg_color); 
+          it.filled_rectangle(14, 108, 100, 15, bg_color);
+          
+          float max_p = id(conf_max_pwr).state;
+          if (max_p < 100) max_p = 100; 
+
+          int b_w = (int)((pwr / max_p) * 50.0);
+          
+          if (b_w > 1) { 
+            int fill = min(b_w, 50);
+            it.filled_rectangle(64, 108, fill, 15, p_color); 
+            it.filled_circle(64 + fill, 115, 7, p_color); 
+            it.filled_rectangle(64 - 8, 108, 8, 15, bg_color);
+          } 
+          else if (b_w < -1) { 
+            int fill = min(abs(b_w), 50);
+            it.filled_rectangle(64 - fill, 108, fill, 15, p_color); 
+            it.filled_circle(64 - fill, 115, 7, p_color); 
+            it.filled_rectangle(64, 108, 8, 15, bg_color);
+          }
+          it.line(64, 106, 64, 124, Color(255,255,255));
+
+      # --- PAGE 3 (DRIFT) ---
+      - id: page3
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          if (id(show_border)) { it.rectangle(0, 0, 128, 128, Color(0, 0, 255)); it.rectangle(1, 1, 126, 126, Color(0, 0, 255)); }
+          if (id(api_server).is_connected()) it.filled_circle(115, 6, 2, Color(100, 255, 100));
+          if (id(bms_ble_client).connected()) it.filled_circle(124, 6, 2, Color(0, 100, 255));
+
+          if (id(conf_lang).current_option() == "Deutsch") {
+            it.print(2, 2, id(font_small), Color(80, 80, 80), TextAlign::TOP_LEFT, "ZELL-DRIFT");
+          } else {
+            it.print(2, 2, id(font_small), Color(80, 80, 80), TextAlign::TOP_LEFT, "CELL-DRIFT");
+          }
+          
+          float drift = id(bms_delta).state;
+          if (std::isnan(drift)) drift = 0.0;
+
+          Color d_color = (drift > 0.02) ? Color(255,0,0) : (drift > 0.01) ? Color(255,165,0) : Color(0,255,0);
+          it.printf(64, 32, id(font_huge), d_color, TextAlign::CENTER, "%.3f", drift);
+          
+          if (id(bms_min_v).has_state() && id(bms_max_v).has_state()) {
+            it.printf(64, 75, id(font_small), Color(200, 200, 200), TextAlign::CENTER, "%.3f - %.3f V", id(bms_min_v).state, id(bms_max_v).state);
+            it.printf(64, 92, id(font_small), Color(150, 150, 150), TextAlign::CENTER, "Z%.0f <-> Z%.0f", id(bms_min_cell_num).state, id(bms_max_cell_num).state);
+          }
+          it.filled_circle(14, 115, 7, Color(40, 40, 40)); it.filled_circle(114, 115, 7, Color(40, 40, 40)); it.filled_rectangle(14, 108, 100, 15, Color(40, 40, 40));
+          
+          float max_d = id(conf_max_drift).state;
+          if (max_d <= 0.001) max_d = 0.05; 
+          
+          int bar_d = (int)((drift / max_d) * 100.0); 
+          
+          if (bar_d > 0) {
+            it.filled_circle(14, 115, 7, d_color);
+            int width = (bar_d > 100 ? 100 : bar_d);
+            it.filled_rectangle(14, 108, width, 15, d_color);
+            it.filled_circle(14 + width, 115, 7, d_color);
+          }
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          // 1. BOOT LOGIK
+          static int boot_cnt = 0;
+          auto *active = id(lcd_display).get_active_page();
+          
+          if (active == id(page_boot)) {
+            if (id(conf_bms_mac).state.length() >= 17) {
+              boot_cnt++;
+              id(boot_timer_sec) = boot_cnt; 
+              if ((id(bms_soc_final).has_state() && id(bms_ble_client).connected()) || boot_cnt >= 15) {
+                id(lcd_display).show_page(id(page1));
+              }
+            }
+          }
+
+          // 2. AUTO-CYCLE LOGIK
+          int target = id(conf_page_cycle_time).state;
+          if (target > 0 && active != id(page_setup) && active != id(page_boot)) {
+            id(cycle_timer_counter) += 1;
+            
+            if (id(cycle_timer_counter) >= target) {
+              id(cycle_timer_counter) = 0; // Reset
+              
+              if (active == id(page1)) {
+                id(lcd_display).show_page(id(page2));
+              } else if (active == id(page2)) {
+                id(lcd_display).show_page(id(page3));
+              } else if (active == id(page3)) {
+                id(lcd_display).show_page(id(page1));
+              }
+            }
+          } else {
+            id(cycle_timer_counter) = 0;
+          }
+
+          // 3. SCREENSAVER LOGIK
+          int timeout = id(conf_display_timeout).state;
+          
+          if (timeout > 0 && id(backlight_light).remote_values.is_on()) {
+             id(display_timeout_counter) += 1;
+             
+             if (id(display_timeout_counter) >= timeout) {
+                auto call = id(backlight_light).turn_off();
+                call.perform();
+                id(display_timeout_counter) = 0;
+             }
+          } else {
+             id(display_timeout_counter) = 0;
+          }
+          
+          // 4. AUTO-WAKEUP LOGIK
+          int wake_target = id(conf_wake_interval).state;
+          
+          if (wake_target > 0 && !id(backlight_light).remote_values.is_on()) {
+              id(wake_timer_counter) += 1;
+              if (id(wake_timer_counter) >= wake_target) {
+                  auto call = id(backlight_light).turn_on();
+                  call.perform();
+                  id(wake_timer_counter) = 0;
+                  id(display_timeout_counter) = 0;
+              }
+          } else {
+              id(wake_timer_counter) = 0;
+          }
+
+output:
+  - platform: ledc
+    pin: 16
+    id: backlight_out
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    output: backlight_out
+    name: "Display Helligkeit"
+    id: backlight_light
+    restore_mode: RESTORE_DEFAULT_ON
